@@ -1,57 +1,40 @@
-# tunnel_advanced.py
-import asyncio
-import aiohttp
-import os
-from aiohttp import ClientSession, ClientTimeout
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import StreamingResponse
+from asyncio import Queue
 
-SERVER_URL = "https://streammgram.onrender.com"
-CHUNK_SIZE = 1024 * 64  # 64KB por chunk
-MAX_RETRIES = 5
-POLL_INTERVAL = 0.5  # segundos
+app = FastAPI()
 
-async def poll_worker():
-    """Consulta constante al servidor por paths a procesar"""
-    async with ClientSession(timeout=ClientTimeout(total=None)) as session:
+# Cola por archivo
+file_queues = {}  # {path: Queue()}
+
+@app.get("/poll")
+async def poll():
+    # Devuelve el siguiente path a procesar
+    for path, q in file_queues.items():
+        if not q.empty():
+            return path
+    return ""
+
+@app.post("/send_chunk")
+async def send_chunk(request: Request, x_path: str = Header(...)):
+    """Recibe un chunk para un archivo específico"""
+    chunk = await request.body()
+    if x_path not in file_queues:
+        file_queues[x_path] = Queue()
+    await file_queues[x_path].put(chunk)
+    return {"status": "ok"}
+
+@app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    if full_path not in file_queues:
+        file_queues[full_path] = Queue()
+
+    async def generator():
+        q = file_queues[full_path]
         while True:
-            try:
-                async with session.get(f"{SERVER_URL}/poll") as resp:
-                    path = (await resp.text()).strip()
-                    if path:
-                        asyncio.create_task(stream_path(path, session))
-            except Exception as e:
-                print(f"[!] Error en polling: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+            chunk = await q.get()
+            if not chunk:  # Fin de archivo
+                break
+            yield chunk
 
-async def stream_path(path, session: ClientSession):
-    """Envía un archivo local al servidor en chunks con reintentos automáticos"""
-    file_path = path.lstrip("/")
-    if not os.path.isfile(file_path):
-        print(f"[!] Archivo no encontrado: {file_path}")
-        return
-
-    try:
-        with open(file_path, "rb") as f:
-            chunk_num = 0
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-
-                for attempt in range(MAX_RETRIES):
-                    try:
-                        await session.post(f"{SERVER_URL}/send_chunk", data=chunk)
-                        break
-                    except Exception as e:
-                        print(f"[!] Error enviando chunk {chunk_num}, intento {attempt+1}: {e}")
-                        await asyncio.sleep(0.5)
-                chunk_num += 1
-
-        # Enviar señal de fin de archivo
-        await session.post(f"{SERVER_URL}/send_chunk", data=b"")
-        print(f"[+] Archivo {file_path} enviado correctamente")
-
-    except Exception as e:
-        print(f"[!] Error streaming {file_path}: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(poll_worker())
+    return StreamingResponse(generator(), media_type="application/octet-stream")
