@@ -1,33 +1,50 @@
 from flask import Flask, request, Response, stream_with_context
+import queue
 
 app = Flask(__name__)
-queue = []
+request_queue = queue.Queue()
+response_buffers = {}
 
 @app.route("/poll", methods=["GET", "POST"])
 def poll():
+    """Polling endpoint para el cliente local."""
     if request.method == "POST":
-        # Acumular chunks recibidos de la máquina local
+        # Cliente local envía chunks de la respuesta
+        key = request.headers.get("X-Request-ID")
+        if key and key in response_buffers:
+            response_buffers[key].put(request.data)
         return "OK"
     else:
-        # Devolver el siguiente path a la máquina local
-        if queue:
-            return queue.pop(0)
-        return ""
+        # Devuelve path pendiente a la máquina local
+        try:
+            path = request_queue.get_nowait()
+            return path
+        except queue.Empty:
+            return ""
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def handle_request(path):
-    # Agregamos el path a la cola para que la máquina local lo procese
-    queue.append(path)
+    """Recibe request pública y agrega a la cola."""
+    import uuid
+    request_id = str(uuid.uuid4())
+    request_queue.put(path)
+    response_buffers[request_id] = queue.Queue()
 
-    # Respuesta streaming simulada
     @stream_with_context
     def generate():
-        # Render recibirá los datos enviados en chunks por la máquina local
+        buffer = response_buffers[request_id]
         while True:
-            yield b""  # Inicialmente vacío; los chunks reales llegan vía POST
-    return Response(generate(), status=200, mimetype="application/octet-stream")
+            chunk = buffer.get()
+            if chunk == b"__END__":
+                break
+            yield chunk
+        del response_buffers[request_id]
 
+    headers = {"X-Request-ID": request_id}
+    return Response(generate(), headers=headers, mimetype="application/octet-stream")
+    
 if __name__ == "__main__":
     import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
