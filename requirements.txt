@@ -3,4 +3,4 @@ gunicorn
 fastapi
 python-multipart
 uvicorn[standard]==0.25.0
-aiohttp==3.9.9
+aiohttp
