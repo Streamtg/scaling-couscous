@@ -1,50 +1,46 @@
-from flask import Flask, request, Response, stream_with_context
-import queue
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+import asyncio
 
-app = Flask(__name__)
-request_queue = queue.Queue()
+app = FastAPI()
+
+# Diccionario de buffers para cada request
 response_buffers = {}
+request_queue = asyncio.Queue()
 
-@app.route("/poll", methods=["GET", "POST"])
-def poll():
-    """Polling endpoint para el cliente local."""
-    if request.method == "POST":
-        # Cliente local envía chunks de la respuesta
-        key = request.headers.get("X-Request-ID")
-        if key and key in response_buffers:
-            response_buffers[key].put(request.data)
-        return "OK"
-    else:
-        # Devuelve path pendiente a la máquina local
-        try:
-            path = request_queue.get_nowait()
-            return path
-        except queue.Empty:
-            return ""
+@app.get("/poll")
+async def poll():
+    """Devuelve el siguiente path pendiente para la máquina local"""
+    try:
+        path = request_queue.get_nowait()
+        return path
+    except asyncio.QueueEmpty:
+        return ""
 
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def handle_request(path):
-    """Recibe request pública y agrega a la cola."""
+@app.post("/poll")
+async def poll_post(request: Request):
+    """Recibe chunks desde la máquina local"""
+    data = await request.body()
+    request_id = request.headers.get("X-Request-ID")
+    if request_id in response_buffers:
+        await response_buffers[request_id].put(data)
+    return {"status": "ok"}
+
+@app.get("/{full_path:path}")
+async def proxy(full_path: str):
+    """Recibe request pública y devuelve streaming asincrónico"""
     import uuid
     request_id = str(uuid.uuid4())
-    request_queue.put(path)
-    response_buffers[request_id] = queue.Queue()
+    await request_queue.put(full_path)
+    buffer = asyncio.Queue()
+    response_buffers[request_id] = buffer
 
-    @stream_with_context
-    def generate():
-        buffer = response_buffers[request_id]
+    async def stream_generator():
         while True:
-            chunk = buffer.get()
+            chunk = await buffer.get()
             if chunk == b"__END__":
                 break
             yield chunk
         del response_buffers[request_id]
 
-    headers = {"X-Request-ID": request_id}
-    return Response(generate(), headers=headers, mimetype="application/octet-stream")
-    
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    return StreamingResponse(stream_generator(), media_type="application/octet-stream", headers={"X-Request-ID": request_id})
