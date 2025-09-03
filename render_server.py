@@ -1,57 +1,57 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+# tunnel_advanced.py
 import asyncio
+import aiohttp
+import os
+from aiohttp import ClientSession, ClientTimeout
 
-app = FastAPI()
+SERVER_URL = "https://streammgram.onrender.com"
+CHUNK_SIZE = 1024 * 64  # 64KB por chunk
+MAX_RETRIES = 5
+POLL_INTERVAL = 0.5  # segundos
 
-# Cola de paths enviados por los clientes
-request_queue = asyncio.Queue()
-
-# Cola de chunks enviados desde clientes locales
-chunk_queues = {}
-
-@app.get("/poll")
-async def poll():
-    """
-    La máquina local hace polling para obtener paths pendientes
-    """
-    try:
-        path = request_queue.get_nowait()
-        return JSONResponse(content={"path": path})
-    except asyncio.QueueEmpty:
-        return JSONResponse(content={"path": ""})
-
-@app.post("/push/{path:path}")
-async def push(path: str, request: Request):
-    """
-    La máquina local envía chunks de datos al servidor
-    """
-    body = await request.body()
-    if path not in chunk_queues:
-        chunk_queues[path] = asyncio.Queue()
-    await chunk_queues[path].put(body)
-    return JSONResponse(content={"status": "ok"})
-
-@app.get("/{path:path}")
-async def stream_file(path: str):
-    """
-    Servir los datos enviados por la máquina local como StreamingResponse
-    """
-    if path not in chunk_queues:
-        chunk_queues[path] = asyncio.Queue()
-
-    async def generator():
+async def poll_worker():
+    """Consulta constante al servidor por paths a procesar"""
+    async with ClientSession(timeout=ClientTimeout(total=None)) as session:
         while True:
-            chunk = await chunk_queues[path].get()
-            yield chunk
+            try:
+                async with session.get(f"{SERVER_URL}/poll") as resp:
+                    path = (await resp.text()).strip()
+                    if path:
+                        asyncio.create_task(stream_path(path, session))
+            except Exception as e:
+                print(f"[!] Error en polling: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
-    # streaming de tipo binario
-    return StreamingResponse(generator(), media_type="application/octet-stream")
+async def stream_path(path, session: ClientSession):
+    """Envía un archivo local al servidor en chunks con reintentos automáticos"""
+    file_path = path.lstrip("/")
+    if not os.path.isfile(file_path):
+        print(f"[!] Archivo no encontrado: {file_path}")
+        return
 
-@app.get("/")
-async def root():
-    return JSONResponse(content={"status": "running"})
+    try:
+        with open(file_path, "rb") as f:
+            chunk_num = 0
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        await session.post(f"{SERVER_URL}/send_chunk", data=chunk)
+                        break
+                    except Exception as e:
+                        print(f"[!] Error enviando chunk {chunk_num}, intento {attempt+1}: {e}")
+                        await asyncio.sleep(0.5)
+                chunk_num += 1
+
+        # Enviar señal de fin de archivo
+        await session.post(f"{SERVER_URL}/send_chunk", data=b"")
+        print(f"[+] Archivo {file_path} enviado correctamente")
+
+    except Exception as e:
+        print(f"[!] Error streaming {file_path}: {e}")
 
 if __name__ == "__main__":
-    import os, uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    asyncio.run(poll_worker())
