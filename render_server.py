@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import asyncio
+import uuid
+import os
 
 app = FastAPI()
 
@@ -29,7 +31,6 @@ async def poll_post(request: Request):
 @app.get("/{full_path:path}")
 async def proxy(full_path: str):
     """Recibe request pública y devuelve streaming asincrónico"""
-    import uuid
     request_id = str(uuid.uuid4())
     await request_queue.put(full_path)
     buffer = asyncio.Queue()
@@ -43,4 +44,12 @@ async def proxy(full_path: str):
             yield chunk
         del response_buffers[request_id]
 
-    return StreamingResponse(stream_generator(), media_type="application/octet-stream", headers={"X-Request-ID": request_id})
+    return StreamingResponse(
+        stream_generator(),
+        media_type="application/octet-stream",
+        headers={"X-Request-ID": request_id}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
