@@ -2,3 +2,4 @@ flask
 gunicorn
 uvicorn
 fastapi
+python-multipart
