@@ -1,80 +1,66 @@
-import asyncio
-import json
+# relay_fastapi.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
-import aiohttp
+import asyncio
+import json
 
 app = FastAPI()
 
-client_ws: WebSocket | None = None
-ws_lock = asyncio.Lock()  # Bloquea acceso a client_ws
-
+# WebSocket global para un cliente Render
+client_ws: WebSocket = None
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Mantiene vivo el WebSocket con el bot local"""
     global client_ws
     await websocket.accept()
-    async with ws_lock:
-        client_ws = websocket
-    print("[+] Bot local conectado al relay")
-
+    client_ws = websocket
+    print("[+] Render conectado via WebSocket")
     try:
         while True:
-            await asyncio.sleep(15)  # heartbeat
-            try:
-                await websocket.send_bytes(b"__PING__")
-            except:
-                break
+            await asyncio.sleep(10)  # heartbeat para mantener vivo el socket
     except WebSocketDisconnect:
-        print("[!] Bot local desconectado")
-    finally:
-        async with ws_lock:
-            client_ws = None
+        client_ws = None
+        print("[!] Render desconectado")
 
-
-@app.api_route("/{path:path}", methods=["GET", "POST"])
-async def proxy(path: str, request: Request):
-    """Recibe solicitudes externas y las reenvía al bot local"""
+@app.api_route("/{full_path:path}", methods=["GET", "POST"])
+async def proxy(full_path: str, request: Request):
+    """
+    Proxy para redirigir requests del relay Render al bot local.
+    Maneja query params y streaming en chunks.
+    """
     global client_ws
+    if client_ws is None:
+        return {"error": "No hay cliente Render conectado"}
 
-    async with ws_lock:
-        if client_ws is None:
-            return {"error": "No hay cliente conectado"}
+    # Reconstruir path completo con query params
+    query_string = str(request.url.query)
+    path = f"/{full_path}"
+    if query_string:
+        path += f"?{query_string}"
 
-        # Normaliza query string
-        query = str(request.url.query).replace("?", "&")
-        full_path = f"/{path}"
-        if query:
-            full_path += f"?{query}"
+    # Leer body si existe
+    body = await request.body()
+    body_text = body.decode("utf-8", errors="ignore")
 
-        body = await request.body()
-        msg = json.dumps({
-            "method": request.method,
-            "path": full_path,
-            "headers": dict(request.headers),
-            "body": body.decode("utf-8", errors="ignore")
-        })
+    # Preparar mensaje JSON para Render
+    msg = json.dumps({
+        "method": request.method,
+        "path": path,
+        "headers": dict(request.headers),
+        "body": body_text
+    })
 
-        # Enviar solicitud al bot local
-        await client_ws.send_text(msg)
+    # Enviar mensaje al cliente Render
+    await client_ws.send_text(msg)
 
+    # Función generadora de streaming
     async def stream_response():
-        """Recibe chunks desde el bot local y los envía al cliente HTTP"""
         try:
             while True:
-                try:
-                    # Timeout evita que quede bloqueado si el bot falla
-                    data = await asyncio.wait_for(client_ws.receive_bytes(), timeout=30)
-                except asyncio.TimeoutError:
-                    print("[!] Timeout esperando datos del bot local")
-                    break
+                data = await client_ws.receive_bytes()
                 if data == b"__END__":
                     break
                 yield data
-        except WebSocketDisconnect:
-            print("[!] Bot local desconectado durante streaming")
-            yield b""
         except Exception as e:
             print(f"[!] Error streaming: {e}")
             yield b""
