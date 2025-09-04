@@ -6,33 +6,34 @@ import os
 import json
 
 app = FastAPI()
-client_ws: WebSocket = None
+clients = {}  # Diccionario para múltiples conexiones WebSocket
 CHUNK_SIZE = 64 * 1024  # 64KB por chunk
 
 # ----------------------------
 # WebSocket endpoint (Render)
 # ----------------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    global client_ws
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
-    client_ws = websocket
-    print("[+] Render conectado via WebSocket")
+    clients[client_id] = websocket
+    print(f"[+] Render conectado: {client_id}")
     try:
         while True:
             await asyncio.sleep(10)  # mantener vivo el socket
     except WebSocketDisconnect:
-        client_ws = None
-        print("[!] Render desconectado")
+        clients.pop(client_id, None)
+        print(f"[!] Render desconectado: {client_id}")
 
 # ----------------------------
 # Proxy de archivos locales
 # ----------------------------
 @app.api_route("/{full_path:path}", methods=["GET", "POST"])
 async def proxy(full_path: str, request: Request):
-    global client_ws
-    if client_ws is None:
-        return {"error": "No hay cliente Render conectado"}
+    client_id = request.headers.get("X-Client-ID")
+    if not client_id or client_id not in clients:
+        return {"error": "No hay cliente Render conectado o X-Client-ID no definido"}
+
+    websocket = clients[client_id]
 
     # Reconstruir path con query params
     query_string = str(request.url.query)
@@ -48,9 +49,9 @@ async def proxy(full_path: str, request: Request):
         "headers": dict(request.headers),
         "body": body.decode("utf-8", errors="ignore")
     })
-    await client_ws.send_text(msg)
+    await websocket.send_text(msg)
 
-    # Stream incremental desde archivo local
+    # Stream incremental desde archivo local o WebSocket
     async def stream_response():
         local_path = full_path.lstrip("/")  # Ajusta según tu estructura
         if os.path.isfile(local_path):
@@ -60,9 +61,9 @@ async def proxy(full_path: str, request: Request):
                         chunk = f.read(CHUNK_SIZE)
                         if not chunk:
                             break
-                        await client_ws.send(chunk)
+                        await websocket.send(chunk)
                         yield chunk
-                await client_ws.send(b"__END__")
+                await websocket.send(b"__END__")
             except Exception as e:
                 print(f"[!] Error streaming archivo {local_path}: {e}")
                 yield b""
@@ -70,7 +71,7 @@ async def proxy(full_path: str, request: Request):
             # Esperar streaming desde WebSocket si el archivo no existe local
             try:
                 while True:
-                    data = await client_ws.receive_bytes()
+                    data = await websocket.receive_bytes()
                     if data == b"__END__":
                         break
                     yield data
