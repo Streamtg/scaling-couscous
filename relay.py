@@ -5,7 +5,6 @@ import json
 
 app = FastAPI()
 client_ws = None
-CHUNK_SIZE = 64 * 1024
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -24,17 +23,16 @@ async def proxy(path: str, request: Request):
     if not client_ws:
         return {"error": "No hay cliente conectado"}
 
-    # Mensaje a enviar al túnel local
     body = await request.body()
+    query_string = f"?{request.url.query}" if request.url.query else ""
     msg = json.dumps({
         "method": request.method,
-        "path": "/" + path + ("?" + request.url.query if request.url.query else ""),
+        "path": "/" + path + query_string,
         "headers": dict(request.headers),
         "body": body.decode("utf-8", errors="ignore")
     })
     await client_ws.send_text(msg)
 
-    # Stream de respuesta
     async def stream_response():
         try:
             while True:
@@ -46,4 +44,4 @@ async def proxy(path: str, request: Request):
             print(f"[!] Error streaming: {e}")
             yield b""
 
-    return StreamingResponse(stream_response())
+    return StreamingResponse(stream_response(), media_type="application/octet-stream")
