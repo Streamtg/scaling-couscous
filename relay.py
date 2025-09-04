@@ -5,7 +5,6 @@ import json
 
 app = FastAPI()
 
-# Guardamos el WebSocket del cliente local
 client_ws: WebSocket = None
 
 @app.websocket("/ws")
@@ -14,8 +13,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     client_ws = websocket
     try:
+        # En lugar de esperar mensajes, solo mantenemos el socket vivo
         while True:
-            await websocket.receive_text()  # Mantener viva la conexión
+            await asyncio.sleep(10)  # heartbeat dummy
     except WebSocketDisconnect:
         client_ws = None
 
@@ -25,7 +25,6 @@ async def proxy(path: str, request: Request):
     if client_ws is None:
         return {"error": "No hay cliente conectado"}
 
-    # Preparamos la petición para el cliente
     body = await request.body()
     msg = json.dumps({
         "method": request.method,
@@ -34,10 +33,9 @@ async def proxy(path: str, request: Request):
         "body": body.decode("utf-8", errors="ignore")
     })
 
-    # Enviamos la petición al cliente
+    # enviamos al cliente
     await client_ws.send_text(msg)
 
-    # Esperamos la respuesta en chunks
     async def stream_response():
         try:
             while True:
@@ -45,7 +43,8 @@ async def proxy(path: str, request: Request):
                 if data == b"__END__":
                     break
                 yield data
-        except Exception:
+        except Exception as e:
+            print(f"[!] Error streaming: {e}")
             yield b""
 
     return StreamingResponse(stream_response())
