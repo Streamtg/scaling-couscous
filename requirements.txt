@@ -2,5 +2,5 @@ flask
 gunicorn
 fastapi
 python-multipart
-uvicorn[standard]==0.25.0
+uvicorn[standard]
 aiohttp
