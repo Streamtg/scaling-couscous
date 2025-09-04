@@ -8,9 +8,6 @@ client_ws: WebSocket = None
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Mantiene conexión WebSocket con el cliente (túnel local).
-    """
     global client_ws
     await websocket.accept()
     client_ws = websocket
@@ -22,25 +19,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
-    """
-    Recibe peticiones HTTP del bot y las envía al túnel.
-    Stream real de datos hacia Render.
-    """
     global client_ws
     if not client_ws:
         return {"error": "No hay cliente conectado"}
 
-    # Construir mensaje
-    query_string = f"?{request.url.query}" if request.url.query else ""
+    query = f"?{request.url.query}" if request.url.query else ""
     body = await request.body()
     msg = json.dumps({
         "method": request.method,
-        "path": "/" + path + query_string,
-        "headers": dict(request.headers),
-        "body": body.decode("utf-8", errors="ignore")
+        "path": "/" + path + query,
+        "body": body.decode(errors="ignore")
     })
 
-    # Enviar al túnel
     await client_ws.send_text(msg)
 
     async def stream_response():
@@ -49,7 +39,8 @@ async def proxy(path: str, request: Request):
                 data = await client_ws.receive_bytes()
                 if data == b"__END__":
                     break
-                yield data
+                if data:
+                    yield data
         except Exception as e:
             print(f"[!] Error streaming: {e}")
             yield b""
