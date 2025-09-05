@@ -1,11 +1,11 @@
 # relay_render.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio, json, uuid
 
 app = FastAPI()
 client_ws: WebSocket = None
-queues = {}  # por request id
+queues = {}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -17,32 +17,29 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             await asyncio.sleep(10)  # heartbeat
     except WebSocketDisconnect:
-        print("[!] Cliente local desconectado")
+        print("[!] Cliente desconectado")
         client_ws = None
 
-@app.api_route("/{path:path}", methods=["GET"])
-async def proxy(path: str, request: Request):
+@app.get("/stream/{file_id}")
+async def stream_file(file_id: str, request: Request):
+    """Endpoint principal de streaming con fallback"""
     global client_ws
     if client_ws is None:
-        return {"error": "No hay cliente conectado"}
+        return JSONResponse({"error": "No hay cliente conectado"}, status_code=503)
 
     req_id = str(uuid.uuid4())
-    body = await request.body()
     range_header = request.headers.get("range")
 
+    # mandar al cliente local
     msg = json.dumps({
         "id": req_id,
-        "method": request.method,
-        "path": "/" + path + ("?" + request.url.query if request.url.query else ""),
-        "headers": dict(request.headers),
-        "body": body.decode("utf-8", errors="ignore"),
+        "file_id": file_id,
         "range": range_header
     })
-
     queues[req_id] = asyncio.Queue()
     await client_ws.send_text(msg)
 
-    async def stream_response():
+    async def iterfile():
         try:
             while True:
                 chunk = await queues[req_id].get()
@@ -50,33 +47,27 @@ async def proxy(path: str, request: Request):
                     break
                 yield chunk
         except Exception as e:
-            print(f"[!] Error streaming: {e}")
+            print(f"[!] Error en iterfile: {e}")
             yield b""
         finally:
-            del queues[req_id]
+            queues.pop(req_id, None)
 
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Content-Type": "video/mp4"
-    }
-
+    headers = {"Accept-Ranges": "bytes"}
     status_code = 200
     if range_header:
-        # Parsear Range: "bytes=start-end"
-        try:
-            _, range_val = range_header.split("=")
-            start_str, end_str = range_val.split("-")
-            start = int(start_str)
-            end = int(end_str) if end_str else None
-        except Exception:
-            start, end = 0, None
-        headers["Content-Range"] = f"bytes {start}-{end or ''}/{{fileSize}}"
+        headers["Content-Range"] = f"bytes */*"
         status_code = 206
 
-    return StreamingResponse(
-        stream_response(),
-        status_code=status_code,
-        headers=headers
-    )
+    return StreamingResponse(iterfile(), status_code=status_code, headers=headers)
+
+@app.post("/push/{req_id}")
+async def push_chunk(req_id: str, request: Request):
+    """Cliente local envía chunks aquí como fallback HTTP"""
+    if req_id not in queues:
+        return JSONResponse({"error": "request_id inválido"}, status_code=404)
+    data = await request.body()
+    if data == b"__END__":
+        await queues[req_id].put(b"__END__")
+    else:
+        await queues[req_id].put(data)
+    return {"ok": True}
