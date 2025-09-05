@@ -4,13 +4,17 @@ import asyncio
 import json
 import uuid
 import struct
-import os
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
-clients = {}  # Diccionario de clientes WebSocket: {client_id: WebSocket}
-queues = {}  # Colas para chunks: {req_id: Queue}
-metadata_events = {}  # Eventos para metadata: {req_id: Event}
-metadata_dict = {}  # Metadata: {req_id: dict}
+clients = {}  # {client_id: WebSocket}
+queues = {}  # {req_id: Queue}
+metadata_events = {}  # {req_id: Event}
+metadata_dict = {}  # {req_id: dict}
 
 async def receive_task(client_id: str, websocket: WebSocket):
     while True:
@@ -31,6 +35,7 @@ async def receive_task(client_id: str, websocket: WebSocket):
                 data = message[pos:pos + data_len].decode('utf-8')
                 meta = json.loads(data)
                 if req_id in metadata_dict:
+                    logger.info(f"Metadata recibido para req_id={req_id}: {meta}")
                     metadata_dict[req_id] = meta
                     metadata_events[req_id].set()
 
@@ -45,15 +50,24 @@ async def receive_task(client_id: str, websocket: WebSocket):
                 if req_id in queues:
                     await queues[req_id].put(b"__END__")
 
+            elif msg_type == 3:  # error
+                data_len = struct.unpack('>I', message[pos:pos + 4])[0]
+                pos += 4
+                error_msg = message[pos:pos + data_len].decode('utf-8')
+                if req_id in metadata_dict:
+                    logger.error(f"Error desde cliente para req_id={req_id}: {error_msg}")
+                    metadata_dict[req_id] = {"error": error_msg}
+                    metadata_events[req_id].set()
+
         except Exception as e:
-            print(f"[!] Error en receive_task para {client_id}: {e}")
+            logger.error(f"Error en receive_task para {client_id}: {e}")
             break
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     clients[client_id] = websocket
-    print(f"[+] Cliente {client_id} conectado")
+    logger.info(f"Cliente {client_id} conectado")
 
     recv_task = asyncio.create_task(receive_task(client_id, websocket))
 
@@ -61,17 +75,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         while True:
             await asyncio.sleep(10)  # heartbeat
     except WebSocketDisconnect:
-        print(f"[!] Cliente {client_id} desconectado")
+        logger.info(f"Cliente {client_id} desconectado")
         clients.pop(client_id, None)
         recv_task.cancel()
 
 @app.get("/stream/{file_id}")
 async def stream_file(file_id: str, request: Request):
     if not clients:
+        logger.error("No hay clientes conectados")
         return JSONResponse({"error": "No hay clientes conectados"}, status_code=503)
 
     req_id = str(uuid.uuid4())
     range_header = request.headers.get("range")
+    logger.info(f"Nueva solicitud para file_id={file_id}, req_id={req_id}, range={range_header}")
 
     queues[req_id] = asyncio.Queue()
     metadata_events[req_id] = asyncio.Event()
@@ -91,18 +107,27 @@ async def stream_file(file_id: str, request: Request):
             disconnected.append(client_id)
 
     for client_id in disconnected:
+        logger.warning(f"Cliente {client_id} desconectado durante envío")
         clients.pop(client_id, None)
 
-    # Esperar metadata de cualquier cliente
+    # Esperar metadata
     try:
-        await asyncio.wait_for(metadata_events[req_id].wait(), timeout=10)
+        await asyncio.wait_for(metadata_events[req_id].wait(), timeout=30)
     except asyncio.TimeoutError:
+        logger.error(f"Timeout esperando metadata para req_id={req_id}")
         queues.pop(req_id, None)
         metadata_events.pop(req_id, None)
         metadata_dict.pop(req_id, None)
         return JSONResponse({"error": "Timeout esperando metadata"}, status_code=504)
 
     meta = metadata_dict[req_id]
+    if "error" in meta:
+        logger.error(f"Error en metadata para req_id={req_id}: {meta['error']}")
+        queues.pop(req_id, None)
+        metadata_events.pop(req_id, None)
+        metadata_dict.pop(req_id, None)
+        return JSONResponse({"error": meta["error"]}, status_code=404)
+
     status_code = 200
     headers = {
         "Accept-Ranges": "bytes",
@@ -120,13 +145,14 @@ async def stream_file(file_id: str, request: Request):
                     break
                 yield chunk
         except Exception as e:
-            print(f"[!] Error en iterfile: {e}")
+            logger.error(f"Error en iterfile para req_id={req_id}: {e}")
             yield b""
         finally:
             queues.pop(req_id, None)
             metadata_events.pop(req_id, None)
             metadata_dict.pop(req_id, None)
 
+    logger.info(f"Streaming iniciado para file_id={file_id}, req_id={req_id}")
     return StreamingResponse(
         iterfile(),
         status_code=status_code,
@@ -137,6 +163,7 @@ async def stream_file(file_id: str, request: Request):
 @app.post("/push/{req_id}")
 async def push_chunk(req_id: str, request: Request):
     if req_id not in queues:
+        logger.error(f"request_id inválido: {req_id}")
         return JSONResponse({"error": "request_id inválido"}, status_code=404)
     data = await request.body()
     if data == b"__END__":
