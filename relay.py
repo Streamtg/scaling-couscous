@@ -20,7 +20,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     global client_ws
-    if not client_ws:
+    if client_ws is None:
         return {"error": "No hay cliente conectado"}
 
     query = f"?{request.url.query}" if request.url.query else ""
@@ -31,18 +31,20 @@ async def proxy(path: str, request: Request):
         "body": body.decode(errors="ignore")
     })
 
+    # Enviar al cliente inmediatamente
     await client_ws.send_text(msg)
 
     async def stream_response():
         try:
             while True:
-                data = await client_ws.receive_bytes()
-                if data == b"__END__":
+                # Recibir chunk desde el cliente
+                chunk = await client_ws.receive_bytes()
+                if chunk == b"__END__":
                     break
-                if data:
-                    yield data
+                if chunk:
+                    yield chunk
         except Exception as e:
-            print(f"[!] Error streaming: {e}")
+            print(f"[!] Error en streaming: {e}")
             yield b""
 
     return StreamingResponse(stream_response(), media_type="application/octet-stream")
