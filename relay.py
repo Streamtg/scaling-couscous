@@ -1,59 +1,42 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
-import asyncio
-import json
-from typing import Dict
+import asyncio, json, uuid
 
 app = FastAPI()
-
 client_ws: WebSocket = None
-queues: Dict[str, asyncio.Queue] = {}  # una cola por request_id
+queues = {}  # diccionario por request id
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global client_ws
     await websocket.accept()
     client_ws = websocket
-    print("[+] Cliente local conectado")
-
     try:
         while True:
-            # 🔑 recibir chunks centralizado
-            data = await websocket.receive_bytes()
-            # Primeros 36 bytes reservados para el request_id
-            req_id = data[:36].decode("utf-8", errors="ignore")
-            chunk = data[36:]
-
-            if req_id in queues:
-                await queues[req_id].put(chunk)
+            await asyncio.sleep(10)  # heartbeat
     except WebSocketDisconnect:
-        print("[!] Cliente desconectado")
         client_ws = None
 
-
-@app.api_route("/{path:path}", methods=["GET", "POST"])
+@app.api_route("/{path:path}", methods=["GET"])
 async def proxy(path: str, request: Request):
     global client_ws
     if client_ws is None:
         return {"error": "No hay cliente conectado"}
 
-    # 🔑 request_id único
-    import uuid
     req_id = str(uuid.uuid4())
-
     body = await request.body()
+    range_header = request.headers.get("range")
+
     msg = json.dumps({
         "id": req_id,
         "method": request.method,
         "path": "/" + path + ("?" + request.url.query if request.url.query else ""),
         "headers": dict(request.headers),
-        "body": body.decode("utf-8", errors="ignore")
+        "body": body.decode("utf-8", errors="ignore"),
+        "range": range_header
     })
 
-    # preparar cola para este request
     queues[req_id] = asyncio.Queue()
-
-    # enviar al cliente local
     await client_ws.send_text(msg)
 
     async def stream_response():
@@ -69,12 +52,30 @@ async def proxy(path: str, request: Request):
         finally:
             del queues[req_id]
 
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "video/mp4"
+    }
+
+    status_code = 200
+    # Si hay Range → 206 Partial Content
+    if range_header:
+        # Parsear Range: "bytes=start-end"
+        try:
+            _, range_val = range_header.split("=")
+            start_str, end_str = range_val.split("-")
+            start = int(start_str)
+            end = int(end_str) if end_str else None
+        except Exception:
+            start = 0
+            end = None
+        headers["Content-Range"] = f"bytes {start}-{end or ''}/{{fileSize}}"  # fileSize lo llenará el cliente
+        status_code = 206
+
     return StreamingResponse(
         stream_response(),
-        media_type="video/mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
+        status_code=status_code,
+        headers=headers
     )
