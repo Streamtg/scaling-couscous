@@ -1,20 +1,23 @@
+# relay_render.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse
 import asyncio, json, uuid
 
 app = FastAPI()
 client_ws: WebSocket = None
-queues = {}  # diccionario por request id
+queues = {}  # por request id
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global client_ws
     await websocket.accept()
     client_ws = websocket
+    print("[+] Cliente local conectado")
     try:
         while True:
             await asyncio.sleep(10)  # heartbeat
     except WebSocketDisconnect:
+        print("[!] Cliente local desconectado")
         client_ws = None
 
 @app.api_route("/{path:path}", methods=["GET"])
@@ -60,7 +63,6 @@ async def proxy(path: str, request: Request):
     }
 
     status_code = 200
-    # Si hay Range → 206 Partial Content
     if range_header:
         # Parsear Range: "bytes=start-end"
         try:
@@ -69,9 +71,8 @@ async def proxy(path: str, request: Request):
             start = int(start_str)
             end = int(end_str) if end_str else None
         except Exception:
-            start = 0
-            end = None
-        headers["Content-Range"] = f"bytes {start}-{end or ''}/{{fileSize}}"  # fileSize lo llenará el cliente
+            start, end = 0, None
+        headers["Content-Range"] = f"bytes {start}-{end or ''}/{{fileSize}}"
         status_code = 206
 
     return StreamingResponse(
