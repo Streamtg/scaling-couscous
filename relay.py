@@ -1,173 +1,140 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
-import asyncio
-import json
-import uuid
-import struct
-import logging
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio, json, uuid, logging
+from typing import Dict, Optional
 
-# Configurar logging
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-clients = {}  # {client_id: WebSocket}
-queues = {}  # {req_id: Queue}
-metadata_events = {}  # {req_id: Event}
-metadata_dict = {}  # {req_id: dict}
+class ConnectionManager:
+    def __init__(self):
+        self.client_ws: Optional[WebSocket] = None
+        self.queues: Dict[str, asyncio.Queue] = {}
+    
+    async def connect(self, websocket: WebSocket):
+        self.client_ws = websocket
+        logger.info("[+] Cliente local conectado")
+    
+    def disconnect(self):
+        self.client_ws = None
+        logger.info("[!] Cliente desconectado")
+    
+    async def send_message(self, message: str):
+        if self.client_ws:
+            await self.client_ws.send_text(message)
 
-async def receive_task(client_id: str, websocket: WebSocket):
-    while True:
-        try:
-            message = await websocket.receive_bytes()
-            if not message:
-                continue
+manager = ConnectionManager()
 
-            msg_type = message[0]
-            id_len = struct.unpack('>I', message[1:5])[0]
-            pos = 5
-            req_id = message[pos:pos + id_len].decode('utf-8')
-            pos += id_len
-
-            if msg_type == 0:  # metadata
-                data_len = struct.unpack('>I', message[pos:pos + 4])[0]
-                pos += 4
-                data = message[pos:pos + data_len].decode('utf-8')
-                meta = json.loads(data)
-                if req_id in metadata_dict:
-                    logger.info(f"Metadata recibido para req_id={req_id}: {meta}")
-                    metadata_dict[req_id] = meta
-                    metadata_events[req_id].set()
-
-            elif msg_type == 1:  # chunk
-                chunk_len = struct.unpack('>I', message[pos:pos + 4])[0]
-                pos += 4
-                chunk = message[pos:pos + chunk_len]
-                if req_id in queues:
-                    await queues[req_id].put(chunk)
-
-            elif msg_type == 2:  # end
-                if req_id in queues:
-                    await queues[req_id].put(b"__END__")
-
-            elif msg_type == 3:  # error
-                data_len = struct.unpack('>I', message[pos:pos + 4])[0]
-                pos += 4
-                error_msg = message[pos:pos + data_len].decode('utf-8')
-                if req_id in metadata_dict:
-                    logger.error(f"Error desde cliente para req_id={req_id}: {error_msg}")
-                    metadata_dict[req_id] = {"error": error_msg}
-                    metadata_events[req_id].set()
-
-        except Exception as e:
-            logger.error(f"Error en receive_task para {client_id}: {e}")
-            break
-
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    clients[client_id] = websocket
-    logger.info(f"Cliente {client_id} conectado")
-
-    recv_task = asyncio.create_task(receive_task(client_id, websocket))
-
+    await manager.connect(websocket)
+    
     try:
         while True:
-            await asyncio.sleep(10)  # heartbeat
+            # Real heartbeat - esperar mensajes del cliente
+            data = await websocket.receive()
+            if data.get("type") == "websocket.disconnect":
+                break
+            # También podemos recibir chunks de datos aquí si es necesario
     except WebSocketDisconnect:
-        logger.info(f"Cliente {client_id} desconectado")
-        clients.pop(client_id, None)
-        recv_task.cancel()
+        logger.info("[!] Cliente WebSocket desconectado")
+    except Exception as e:
+        logger.error(f"[!] Error en WebSocket: {e}")
+    finally:
+        manager.disconnect()
 
 @app.get("/stream/{file_id}")
 async def stream_file(file_id: str, request: Request):
-    if not clients:
-        logger.error("No hay clientes conectados")
-        return JSONResponse({"error": "No hay clientes conectados"}, status_code=503)
+    """Endpoint principal de streaming"""
+    if manager.client_ws is None:
+        raise HTTPException(status_code=503, detail="No hay cliente conectado")
 
     req_id = str(uuid.uuid4())
     range_header = request.headers.get("range")
-    logger.info(f"Nueva solicitud para file_id={file_id}, req_id={req_id}, range={range_header}")
-
-    queues[req_id] = asyncio.Queue()
-    metadata_events[req_id] = asyncio.Event()
-    metadata_dict[req_id] = {}
-
-    # Enviar solicitud a todos los clientes
-    msg = json.dumps({
+    
+    # Enviar solicitud al cliente local
+    message = json.dumps({
+        "type": "stream_request",
         "id": req_id,
         "file_id": file_id,
         "range": range_header
     })
-    disconnected = []
-    for client_id, ws in clients.items():
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            disconnected.append(client_id)
-
-    for client_id in disconnected:
-        logger.warning(f"Cliente {client_id} desconectado durante envío")
-        clients.pop(client_id, None)
-
-    # Esperar metadata
+    
     try:
-        await asyncio.wait_for(metadata_events[req_id].wait(), timeout=30)
+        # Crear queue para esta solicitud
+        manager.queues[req_id] = asyncio.Queue()
+        await manager.send_message(message)
+        
+        # Timeout para esperar respuesta
+        await asyncio.wait_for(manager.queues[req_id].get(), timeout=30.0)
+        
     except asyncio.TimeoutError:
-        logger.error(f"Timeout esperando metadata para req_id={req_id}")
-        queues.pop(req_id, None)
-        metadata_events.pop(req_id, None)
-        metadata_dict.pop(req_id, None)
-        return JSONResponse({"error": "Timeout esperando metadata"}, status_code=504)
+        if req_id in manager.queues:
+            del manager.queues[req_id]
+        raise HTTPException(status_code=504, detail="Timeout esperando respuesta del cliente")
 
-    meta = metadata_dict[req_id]
-    if "error" in meta:
-        logger.error(f"Error en metadata para req_id={req_id}: {meta['error']}")
-        queues.pop(req_id, None)
-        metadata_events.pop(req_id, None)
-        metadata_dict.pop(req_id, None)
-        return JSONResponse({"error": meta["error"]}, status_code=404)
-
-    status_code = 200
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(meta["content_length"])
-    }
-    if range_header:
-        status_code = 206
-        headers["Content-Range"] = f"bytes {meta['start']}-{meta['end']}/{meta['total_size']}"
-
-    async def iterfile():
+    async def generate_chunks():
         try:
             while True:
-                chunk = await queues[req_id].get()
-                if chunk == b"__END__":
+                # Esperar chunks con timeout
+                try:
+                    chunk = await asyncio.wait_for(manager.queues[req_id].get(), timeout=60.0)
+                    if chunk == b"__END__":
+                        break
+                    yield chunk
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout esperando chunk para {req_id}")
                     break
-                yield chunk
         except Exception as e:
-            logger.error(f"Error en iterfile para req_id={req_id}: {e}")
-            yield b""
+            logger.error(f"Error en generador de chunks: {e}")
         finally:
-            queues.pop(req_id, None)
-            metadata_events.pop(req_id, None)
-            metadata_dict.pop(req_id, None)
+            # Limpiar
+            if req_id in manager.queues:
+                del manager.queues[req_id]
 
-    logger.info(f"Streaming iniciado para file_id={file_id}, req_id={req_id}")
+    # Configurar headers apropiados para streaming
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",  # Ajustar según tipo de archivo
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
+    }
+
     return StreamingResponse(
-        iterfile(),
-        status_code=status_code,
-        headers=headers,
-        media_type=meta["content_type"]
+        generate_chunks(),
+        media_type="video/mp4",
+        headers=headers
     )
 
 @app.post("/push/{req_id}")
 async def push_chunk(req_id: str, request: Request):
-    if req_id not in queues:
-        logger.error(f"request_id inválido: {req_id}")
+    """Cliente local envía chunks aquí"""
+    if req_id not in manager.queues:
         return JSONResponse({"error": "request_id inválido"}, status_code=404)
+    
     data = await request.body()
     if data == b"__END__":
-        await queues[req_id].put(b"__END__")
+        await manager.queues[req_id].put(b"__END__")
     else:
-        await queues[req_id].put(data)
-    return {"ok": True}
+        await manager.queues[req_id].put(data)
+    
+    return {"ok": True, "size": len(data)}
+
+@app.get("/health")
+async def health_check():
+    """Endpoint de health check"""
+    return {"status": "ok", "client_connected": manager.client_ws is not None}
