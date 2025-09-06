@@ -1,13 +1,21 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio, json, uuid, logging
-from typing import Dict, Optional
-from datetime import datetime
+import asyncio
+import json
+import uuid
+import logging
+import time
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+import secrets
 
-app = FastAPI()
+# Configuración
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Add CORS middleware
+app = FastAPI(title="Tunnel Relay Server")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,173 +24,296 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+@dataclass
+class TunnelClient:
+    websocket: WebSocket
+    client_id: str
+    subdomain: str
+    last_heartbeat: float
+    is_active: bool = True
 
-class ConnectionManager:
+@dataclass
+class TunnelRequest:
+    request_id: str
+    method: str
+    url: str
+    headers: Dict
+    body: bytes
+    client_id: str
+    created_at: float
+    response_queue: asyncio.Queue
+
+class TunnelManager:
     def __init__(self):
-        self.client_ws: Optional[WebSocket] = None
-        self.queues: Dict[str, asyncio.Queue] = {}
-        self.last_heartbeat: Optional[datetime] = None
-    
-    async def connect(self, websocket: WebSocket):
-        self.client_ws = websocket
-        self.last_heartbeat = datetime.now()
-        logger.info("[+] Cliente local conectado")
-    
-    def disconnect(self):
-        self.client_ws = None
-        self.last_heartbeat = None
-        logger.info("[!] Cliente desconectado")
-    
-    async def send_message(self, message: str):
-        if self.client_ws:
-            try:
-                await self.client_ws.send_text(message)
-                return True
-            except Exception as e:
-                logger.error(f"Error enviando mensaje: {e}")
-                return False
-        return False
-    
-    def is_connected(self):
-        return self.client_ws is not None and (
-            self.last_heartbeat is None or 
-            (datetime.now() - self.last_heartbeat).total_seconds() < 30
-        )
+        self.clients: Dict[str, TunnelClient] = {}
+        self.subdomain_map: Dict[str, str] = {}  # subdomain -> client_id
+        self.requests: Dict[str, TunnelRequest] = {}
+        self.request_timeout = 30.0  # 30 seconds timeout
 
-manager = ConnectionManager()
+    def generate_client_id(self) -> str:
+        return secrets.token_urlsafe(16)
+
+    async def register_client(self, websocket: WebSocket, subdomain: str = None) -> str:
+        client_id = self.generate_client_id()
+        
+        if not subdomain:
+            subdomain = client_id[:8]
+        
+        # Ensure subdomain is unique
+        counter = 1
+        original_subdomain = subdomain
+        while subdomain in self.subdomain_map:
+            subdomain = f"{original_subdomain}-{counter}"
+            counter += 1
+        
+        client = TunnelClient(
+            websocket=websocket,
+            client_id=client_id,
+            subdomain=subdomain,
+            last_heartbeat=time.time()
+        )
+        
+        self.clients[client_id] = client
+        self.subdomain_map[subdomain] = client_id
+        
+        logger.info(f"Client registered: {client_id} with subdomain: {subdomain}")
+        return client_id, subdomain
+
+    def remove_client(self, client_id: str):
+        if client_id in self.clients:
+            client = self.clients[client_id]
+            if client.subdomain in self.subdomain_map:
+                del self.subdomain_map[client.subdomain]
+            del self.clients[client_id]
+            logger.info(f"Client removed: {client_id}")
+
+    def get_client_by_subdomain(self, subdomain: str) -> Optional[TunnelClient]:
+        if subdomain in self.subdomain_map:
+            client_id = self.subdomain_map[subdomain]
+            return self.clients.get(client_id)
+        return None
+
+    async def create_request(self, client_id: str, method: str, url: str, headers: Dict, body: bytes) -> Optional[TunnelRequest]:
+        if client_id not in self.clients:
+            return None
+        
+        request_id = str(uuid.uuid4())
+        response_queue = asyncio.Queue()
+        
+        request = TunnelRequest(
+            request_id=request_id,
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+            client_id=client_id,
+            created_at=time.time(),
+            response_queue=response_queue
+        )
+        
+        self.requests[request_id] = request
+        return request
+
+    def cleanup_expired_requests(self):
+        current_time = time.time()
+        expired_requests = []
+        
+        for request_id, request in self.requests.items():
+            if current_time - request.created_at > self.request_timeout:
+                expired_requests.append(request_id)
+        
+        for request_id in expired_requests:
+            del self.requests[request_id]
+            logger.info(f"Expired request cleaned up: {request_id}")
+
+    async def send_request_to_client(self, request: TunnelRequest) -> bool:
+        if request.client_id not in self.clients:
+            return False
+        
+        client = self.clients[request.client_id]
+        
+        try:
+            request_data = {
+                "type": "request",
+                "request_id": request.request_id,
+                "method": request.method,
+                "url": request.url,
+                "headers": dict(request.headers),
+                "body": request.body.decode('latin1') if request.body else None
+            }
+            
+            await client.websocket.send_text(json.dumps(request_data))
+            return True
+        except Exception as e:
+            logger.error(f"Error sending request to client: {e}")
+            return False
+
+    async def wait_for_response(self, request_id: str) -> Optional[Dict]:
+        if request_id not in self.requests:
+            return None
+        
+        request = self.requests[request_id]
+        
+        try:
+            response_data = await asyncio.wait_for(
+                request.response_queue.get(), 
+                timeout=self.request_timeout
+            )
+            return response_data
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for response: {request_id}")
+            return None
+        finally:
+            if request_id in self.requests:
+                del self.requests[request_id]
+
+    def handle_client_response(self, request_id: str, response_data: Dict):
+        if request_id in self.requests:
+            request = self.requests[request_id]
+            request.response_queue.put_nowait(response_data)
+
+# Global tunnel manager
+tunnel_manager = TunnelManager()
+
+# Background task to cleanup expired requests
+async def cleanup_task():
+    while True:
+        await asyncio.sleep(60)  # Cleanup every minute
+        tunnel_manager.cleanup_expired_requests()
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(cleanup_task())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    await manager.connect(websocket)
+    client_id = None
     
     try:
+        # Initial handshake
+        data = await websocket.receive_text()
+        handshake = json.loads(data)
+        
+        if handshake.get("type") != "register":
+            await websocket.close(code=1008, reason="Invalid handshake")
+            return
+        
+        subdomain = handshake.get("subdomain")
+        client_id, assigned_subdomain = await tunnel_manager.register_client(websocket, subdomain)
+        
+        # Send registration confirmation
+        await websocket.send_text(json.dumps({
+            "type": "registered",
+            "client_id": client_id,
+            "subdomain": assigned_subdomain
+        }))
+        
+        # Heartbeat loop
         while True:
             try:
-                data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                message = json.loads(data)
                 
-                if data.get("type") == "websocket.receive":
-                    text_data = data.get("text")
-                    if text_data:
-                        try:
-                            message = json.loads(text_data)
-                            if message.get("type") == "heartbeat":
-                                manager.last_heartbeat = datetime.now()
-                                await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
-                            elif message.get("type") == "client_ready":
-                                logger.info(f"Cliente listo, path: {message.get('path')}")
-                        except json.JSONDecodeError:
-                            logger.warning("Mensaje no JSON recibido")
+                if message.get("type") == "heartbeat":
+                    # Update last heartbeat
+                    if client_id in tunnel_manager.clients:
+                        tunnel_manager.clients[client_id].last_heartbeat = time.time()
+                    await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
+                
+                elif message.get("type") == "response":
+                    # Handle response from client
+                    request_id = message.get("request_id")
+                    tunnel_manager.handle_client_response(request_id, message)
                 
             except asyncio.TimeoutError:
-                # Verificar conexión
-                if not manager.is_connected():
-                    logger.warning("Heartbeat timeout, cerrando conexión")
-                    break
-                continue
-                
-    except WebSocketDisconnect:
-        logger.info("[!] Cliente WebSocket desconectado")
-    except Exception as e:
-        logger.error(f"[!] Error en WebSocket: {e}")
-    finally:
-        manager.disconnect()
-
-@app.get("/stream/{file_id}")
-async def stream_file(file_id: str, request: Request):
-    """Endpoint principal de streaming"""
-    if not manager.is_connected():
-        raise HTTPException(status_code=503, detail="No hay cliente conectado")
-
-    req_id = str(uuid.uuid4())
-    range_header = request.headers.get("range")
-    
-    # Enviar solicitud al cliente local
-    message = json.dumps({
-        "type": "stream_request",
-        "id": req_id,
-        "file_id": file_id,
-        "range": range_header
-    })
-    
-    # Crear queue para esta solicitud
-    manager.queues[req_id] = asyncio.Queue()
-    
-    if not await manager.send_message(message):
-        del manager.queues[req_id]
-        raise HTTPException(status_code=503, detail="Error comunicando con cliente")
-
-    async def generate_chunks():
-        try:
-            while True:
+                # Send heartbeat to check connection
                 try:
-                    chunk = await asyncio.wait_for(manager.queues[req_id].get(), timeout=120.0)
-                    if chunk == b"__END__":
-                        logger.info(f"Stream completado para {req_id}")
-                        break
-                    yield chunk
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout esperando chunk para {req_id}")
-                    break
-        except Exception as e:
-            logger.error(f"Error en generador de chunks: {e}")
-        finally:
-            # Limpiar
-            if req_id in manager.queues:
-                del manager.queues[req_id]
+                    await websocket.send_text(json.dumps({"type": "heartbeat"}))
+                except:
+                    break  # Connection lost
+            
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {client_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        if client_id:
+            tunnel_manager.remove_client(client_id)
 
-    # Configurar headers para streaming
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Type": "video/mp4",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "Transfer-Encoding": "chunked"
-    }
-
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def tunnel_proxy(request: Request, full_path: str, background_tasks: BackgroundTasks):
+    # Extract subdomain from host
+    host = request.headers.get("host", "")
+    subdomain = host.split(".")[0] if host and "." in host else None
+    
+    if not subdomain:
+        return JSONResponse(
+            {"error": "No subdomain specified"}, 
+            status_code=400
+        )
+    
+    # Find client by subdomain
+    client = tunnel_manager.get_client_by_subdomain(subdomain)
+    if not client or not client.is_active:
+        return JSONResponse(
+            {"error": "Tunnel not found or inactive"}, 
+            status_code=404
+        )
+    
+    # Read request body
+    body = await request.body()
+    
+    # Create tunnel request
+    tunnel_request = await tunnel_manager.create_request(
+        client.client_id,
+        request.method,
+        str(request.url),
+        dict(request.headers),
+        body
+    )
+    
+    if not tunnel_request:
+        return JSONResponse(
+            {"error": "Failed to create tunnel request"}, 
+            status_code=500
+        )
+    
+    # Send request to client
+    if not await tunnel_manager.send_request_to_client(tunnel_request):
+        return JSONResponse(
+            {"error": "Failed to send request to client"}, 
+            status_code=503
+        )
+    
+    # Wait for response from client
+    response_data = await tunnel_manager.wait_for_response(tunnel_request.request_id)
+    
+    if not response_data:
+        return JSONResponse(
+            {"error": "Timeout waiting for response from client"}, 
+            status_code=504
+        )
+    
+    # Extract response details
+    status_code = response_data.get("status_code", 500)
+    headers = response_data.get("headers", {})
+    body = response_data.get("body", "")
+    
+    # Convert body back to bytes if it's a string
+    if isinstance(body, str):
+        body = body.encode('latin1')
+    
+    # Create response
     return StreamingResponse(
-        generate_chunks(),
-        media_type="video/mp4",
+        iter([body]),
+        status_code=status_code,
         headers=headers
     )
 
-@app.post("/push/{req_id}")
-async def push_chunk(req_id: str, request: Request):
-    """Cliente local envía chunks aquí"""
-    if req_id not in manager.queues:
-        return JSONResponse({"error": "request_id inválido"}, status_code=404)
-    
-    data = await request.body()
-    await manager.queues[req_id].put(data)
-    
-    return {"ok": True, "size": len(data)}
-
 @app.get("/health")
 async def health_check():
-    """Endpoint de health check"""
-    status = {
-        "status": "ok" if manager.is_connected() else "no_client",
-        "client_connected": manager.is_connected(),
-        "last_heartbeat": manager.last_heartbeat.isoformat() if manager.last_heartbeat else None,
-        "active_streams": len(manager.queues)
-    }
-    return status
-
-@app.get("/")
-async def root():
-    """Página de inicio"""
-    return {
-        "message": "Streaming Relay Server",
-        "status": "online",
-        "client_connected": manager.is_connected()
-    }
+    return {"status": "ok", "clients": len(tunnel_manager.clients)}
 
 if __name__ == "__main__":
     import uvicorn
