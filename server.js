@@ -5,7 +5,7 @@ const port = process.env.PORT || 10000;
 
 // proxy todo el tráfico a zrok local
 app.use('/', createProxyMiddleware({
-  target: 'http://127.0.0.1:9191', // puerto por defecto de zrok access
+  target: 'http://127.0.0.1:8080', // puerto por defecto de zrok access
   changeOrigin: true,
   ws: true,
   logLevel: 'info'
